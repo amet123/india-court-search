@@ -48,4 +48,30 @@ CREATE TABLE IF NOT EXISTS search_logs (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS case_segments (
+    id              BIGSERIAL PRIMARY KEY,
+    case_id         TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+    segment_type    TEXT NOT NULL,
+    para_start      INTEGER NOT NULL,
+    para_end        INTEGER NOT NULL,
+    confidence      REAL DEFAULT 0.0,
+    model_version   TEXT DEFAULT 'heuristic-v1',
+    preview         TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS case_precedents (
+    id                  BIGSERIAL PRIMARY KEY,
+    case_id             TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+    cited_case_title    TEXT NOT NULL,
+    mention_count       INTEGER DEFAULT 1,
+    paragraphs          INTEGER[] DEFAULT '{}',
+    extraction_method   TEXT DEFAULT 'regex-v1',
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_segments_case ON case_segments(case_id);
+CREATE INDEX IF NOT EXISTS idx_case_segments_type ON case_segments(segment_type);
+CREATE INDEX IF NOT EXISTS idx_case_precedents_case ON case_precedents(case_id);
+
 SELECT 'Schema ready.' AS status;
