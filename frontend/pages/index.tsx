@@ -19,6 +19,33 @@ interface CaseResult {
   score: number;
 }
 
+interface SegmentSpan {
+  type: string;
+  label: string;
+  start_para: number;
+  end_para: number;
+  confidence: number;
+  preview: string;
+}
+
+interface CaseSegmentsResponse {
+  case_id: string;
+  total_paragraphs: number;
+  segments: SegmentSpan[];
+}
+
+interface PrecedentItem {
+  precedent: string;
+  mention_count: number;
+  paragraphs: number[];
+}
+
+interface CasePrecedentsResponse {
+  case_id: string;
+  total_mentions: number;
+  precedents: PrecedentItem[];
+}
+
 interface SearchResponse {
   query: string;
   results: CaseResult[];
@@ -29,6 +56,36 @@ interface SearchResponse {
 
 function CaseCard({ c, query }: { c: CaseResult; query: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [showAnalysis, setShowAnalysis] = useState(false);
+  const [segments, setSegments] = useState<CaseSegmentsResponse | null>(null);
+  const [precedents, setPrecedents] = useState<CasePrecedentsResponse | null>(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+
+  const loadAnalysis = async () => {
+    if (segments || precedents) {
+      setShowAnalysis(!showAnalysis);
+      return;
+    }
+    setAnalysisLoading(true);
+    setAnalysisError(null);
+    try {
+      const [segRes, preRes] = await Promise.all([
+        fetch(`${API}/cases/${c.case_id}/segments`),
+        fetch(`${API}/cases/${c.case_id}/precedents`),
+      ]);
+      if (!segRes.ok || !preRes.ok) throw new Error("Analysis endpoint error");
+      const segData = await segRes.json();
+      const preData = await preRes.json();
+      setSegments(segData);
+      setPrecedents(preData);
+      setShowAnalysis(true);
+    } catch (e: any) {
+      setAnalysisError(e.message || "Could not load analysis");
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
   const highlight = (text: string) => {
     if (!query) return text;
     const words = query.split(/\s+/).filter(w => w.length > 3);
@@ -58,6 +115,9 @@ function CaseCard({ c, query }: { c: CaseResult; query: string }) {
         <button onClick={() => setExpanded(!expanded)} className="text-xs text-orange-600 hover:text-orange-700 font-medium">
           {expanded ? "Show less" : "Read more"}
         </button>
+        <button onClick={loadAnalysis} className="text-xs text-purple-600 hover:text-purple-700 font-medium">
+          {analysisLoading ? "Analyzing…" : (showAnalysis ? "Hide analysis" : "View judgment parts")}
+        </button>
         {c.pdf_url && (
           <a href={`${API}/cases/${c.case_id}/pdf`} target="_blank" rel="noopener noreferrer"
             className="text-xs text-blue-600 hover:text-blue-700 font-medium flex items-center gap-1">
@@ -65,6 +125,33 @@ function CaseCard({ c, query }: { c: CaseResult; query: string }) {
           </a>
         )}
       </div>
+      {analysisError && <p className="text-xs text-red-600 mt-2">{analysisError}</p>}
+      {showAnalysis && (
+        <div className="mt-4 border-t border-gray-100 pt-3 space-y-3">
+          <div>
+            <p className="text-xs font-semibold text-gray-700 mb-2">Judgment sections</p>
+            <div className="grid sm:grid-cols-2 gap-2">
+              {segments?.segments.slice(0, 8).map((s) => (
+                <div key={`${s.type}-${s.start_para}`} className="rounded-lg border border-gray-200 p-2 bg-gray-50">
+                  <p className="text-xs font-semibold text-gray-800">{s.label}</p>
+                  <p className="text-[11px] text-gray-500">Paras {s.start_para}–{s.end_para} · {(s.confidence * 100).toFixed(0)}%</p>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-gray-700 mb-2">Precedents cited</p>
+            <div className="space-y-1.5">
+              {precedents?.precedents.slice(0, 5).map((p) => (
+                <div key={p.precedent} className="text-xs text-gray-600 bg-gray-50 rounded-md border border-gray-200 px-2 py-1.5">
+                  <span className="font-medium text-gray-800">{p.precedent}</span> · {p.mention_count} mentions
+                </div>
+              ))}
+              {precedents && precedents.precedents.length === 0 && <p className="text-xs text-gray-400">No explicit precedents extracted.</p>}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

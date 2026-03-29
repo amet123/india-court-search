@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List, Dict
+import re
 import anthropic
 import asyncpg
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -67,6 +68,29 @@ class SearchRequest(BaseModel):
     year: Optional[int] = Field(None, ge=1950, le=2025)
     disposal: Optional[str] = None
     generate_answer: bool = False
+
+class SegmentSpan(BaseModel):
+    type: str
+    label: str
+    start_para: int
+    end_para: int
+    confidence: float
+    preview: str
+
+class CaseSegmentsResponse(BaseModel):
+    case_id: str
+    total_paragraphs: int
+    segments: List[SegmentSpan]
+
+class PrecedentItem(BaseModel):
+    precedent: str
+    mention_count: int
+    paragraphs: List[int]
+
+class CasePrecedentsResponse(BaseModel):
+    case_id: str
+    total_mentions: int
+    precedents: List[PrecedentItem]
 
 @app.get("/health")
 async def health():
@@ -139,6 +163,103 @@ async def _generate_answer(request, query, results, model):
     except Exception as e:
         return "AI answer abhi available nahi hai."
 
+def _split_paragraphs(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    if parts:
+        return parts
+    return [p.strip() for p in text.split("\n") if p.strip()]
+
+def _normalize_label(label: str) -> str:
+    mapping = {
+        "facts": "Facts",
+        "issues": "Issues",
+        "petitioner_arguments": "Petitioner's Arguments",
+        "respondent_arguments": "Respondent's Arguments",
+        "analysis_of_law": "Analysis of the Law",
+        "precedent_analysis": "Precedent Analysis",
+        "court_reasoning": "Court's Reasoning",
+        "conclusion": "Conclusion",
+    }
+    return mapping.get(label, label.replace("_", " ").title())
+
+def _guess_segment_type(paragraph: str) -> str:
+    p = paragraph.lower()
+    if any(k in p for k in ["facts of the case", "brief facts", "factual matrix"]):
+        return "facts"
+    if any(k in p for k in ["issue for consideration", "points for determination", "the issue is"]):
+        return "issues"
+    if any(k in p for k in ["learned counsel for the petitioner", "petitioner contends", "for the petitioner"]):
+        return "petitioner_arguments"
+    if any(k in p for k in ["learned counsel for the respondent", "respondent contends", "for the respondent", "state submits"]):
+        return "respondent_arguments"
+    if any(k in p for k in ["article", "section", "statute", "constitution", "interpretation"]):
+        return "analysis_of_law"
+    if any(k in p for k in ["relied on", "cited", "precedent", "in the case of", "vs."]):
+        return "precedent_analysis"
+    if any(k in p for k in ["we hold", "in our view", "therefore", "it follows", "we are of the opinion"]):
+        return "court_reasoning"
+    if any(k in p for k in ["appeal is dismissed", "appeal is allowed", "disposed of", "ordered accordingly"]):
+        return "conclusion"
+    return "analysis_of_law"
+
+def _build_segments(case_id: str, text: str) -> CaseSegmentsResponse:
+    paras = _split_paragraphs(text)
+    if not paras:
+        return CaseSegmentsResponse(case_id=case_id, total_paragraphs=0, segments=[])
+    segments: List[SegmentSpan] = []
+    start = 1
+    current_type = _guess_segment_type(paras[0])
+    for idx, paragraph in enumerate(paras, start=1):
+        guessed = _guess_segment_type(paragraph)
+        if guessed != current_type:
+            prev_idx = idx - 1
+            preview = paras[start - 1][:280]
+            segments.append(
+                SegmentSpan(
+                    type=current_type,
+                    label=_normalize_label(current_type),
+                    start_para=start,
+                    end_para=prev_idx,
+                    confidence=0.72,
+                    preview=preview,
+                )
+            )
+            start = idx
+            current_type = guessed
+    preview = paras[start - 1][:280]
+    segments.append(
+        SegmentSpan(
+            type=current_type,
+            label=_normalize_label(current_type),
+            start_para=start,
+            end_para=len(paras),
+            confidence=0.72,
+            preview=preview,
+        )
+    )
+    return CaseSegmentsResponse(case_id=case_id, total_paragraphs=len(paras), segments=segments)
+
+def _extract_precedents(case_id: str, text: str) -> CasePrecedentsResponse:
+    paras = _split_paragraphs(text)
+    precedent_map: Dict[str, Dict[str, object]] = {}
+    pattern = re.compile(r"([A-Z][A-Za-z0-9&.,' -]{2,80}\s+v(?:s\.?|\.?)\s+[A-Z][A-Za-z0-9&.,' -]{2,80})")
+    for idx, para in enumerate(paras, start=1):
+        matches = pattern.findall(para)
+        for m in matches:
+            key = " ".join(m.split())
+            if key not in precedent_map:
+                precedent_map[key] = {"mention_count": 0, "paragraphs": []}
+            precedent_map[key]["mention_count"] = int(precedent_map[key]["mention_count"]) + 1
+            precedent_map[key]["paragraphs"].append(idx)
+    precedents = [
+        PrecedentItem(precedent=name, mention_count=int(data["mention_count"]), paragraphs=data["paragraphs"][:30])
+        for name, data in sorted(precedent_map.items(), key=lambda kv: int(kv[1]["mention_count"]), reverse=True)[:50]
+    ]
+    total = sum(p.mention_count for p in precedents)
+    return CasePrecedentsResponse(case_id=case_id, total_mentions=total, precedents=precedents)
+
 @app.get("/filters/years")
 async def get_years(request: Request):
     pool = request.app.state.pool
@@ -176,3 +297,23 @@ async def get_case_pdf(case_id: str, request: Request, user: Optional[dict] = De
         raise HTTPException(404, "PDF not found")
     from fastapi.responses import RedirectResponse
     return RedirectResponse(row["pdf_url"])
+
+@app.get("/cases/{case_id}/segments", response_model=CaseSegmentsResponse)
+async def get_case_segments(case_id: str, request: Request, user: Optional[dict] = Depends(get_current_user)):
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT case_id, full_text FROM cases WHERE case_id = $1", case_id)
+    if not row:
+        raise HTTPException(404, "Case not found")
+    text = row["full_text"] or ""
+    return _build_segments(case_id, text)
+
+@app.get("/cases/{case_id}/precedents", response_model=CasePrecedentsResponse)
+async def get_case_precedents(case_id: str, request: Request, user: Optional[dict] = Depends(get_current_user)):
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT case_id, full_text FROM cases WHERE case_id = $1", case_id)
+    if not row:
+        raise HTTPException(404, "Case not found")
+    text = row["full_text"] or ""
+    return _extract_precedents(case_id, text)
